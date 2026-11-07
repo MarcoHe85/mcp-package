@@ -2019,56 +2019,58 @@ export default class McpServer {
                 title: 'Read an object',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description:
-                    'Read a single ioBroker object by its ID. For large objects, set offset: 0 to read ' +
-                    'the complete JSON object as base64-encoded UTF-8 byte chunks (at most 512 KiB each). ' +
-                    'Continue at nextOffset, passing the returned sha256 on every subsequent call. ' +
-                    'Reject incomplete reads and verify the SHA-256 of all decoded bytes before parsing the JSON.',
+                    'Read a single ioBroker object by its ID. For the source of a large script use get_script ' +
+                    'with `offset`. Clients that can run code fetch an object too large for one answer in parts: ' +
+                    '`offset: 0`, then `offset: nextOffset` with the `sha256` of the first part until `truncated` ' +
+                    'is false; join the base64 parts and check their SHA-256 before parsing the JSON.',
                 inputSchema: {
                     id: z.string().describe('Object ID, e.g. system.adapter.admin.0 or hm-rpc.0.ABC'),
                     offset: z
                         .number()
                         .int()
                         .min(0)
-                        .max(Number.MAX_SAFE_INTEGER)
                         .optional()
-                        .describe('Byte offset in the serialized JSON object; 0 starts a chunked read'),
+                        .describe('Return the object JSON as base64 part from this byte on (0 for the first part)'),
                     length: z
                         .number()
                         .int()
                         .min(1)
                         .max(DEFAULT_MAX_READ_BYTES)
                         .optional()
-                        .describe('Maximum bytes per chunk (default and maximum 512 KiB); requires offset'),
+                        .describe(
+                            `Maximum bytes per part (default and at most ${DEFAULT_MAX_READ_BYTES}); needs offset`,
+                        ),
                     sha256: z
                         .string()
                         .regex(/^[a-f0-9]{64}$/)
                         .optional()
-                        .describe('SHA-256 returned by the first chunk; required when offset is greater than 0'),
+                        .describe('The sha256 of the first part; needed for offset > 0 to detect a change in between'),
                 },
             },
             async ({ id, offset, length, sha256 }) => {
                 try {
                     if (offset === undefined && (length !== undefined || sha256 !== undefined)) {
-                        throw new Error('length and sha256 require offset');
+                        throw new Error('`length` and `sha256` need `offset`');
                     }
                     if (offset !== undefined && offset > 0 && sha256 === undefined) {
-                        throw new Error('Continuation requires sha256 from the first chunk');
+                        throw new Error('Pass the `sha256` of the first part to read on from an `offset` above 0');
                     }
-                    // Recheck the current user's object ACL on EVERY chunk; no cached objects or transfer links.
+                    // Every part reads the object again with the rights of the session user, so a changed object
+                    // or withdrawn rights are noticed; nothing is cached between the calls.
                     const object = await this.adapter.getForeignObjectAsync(id, { user: this.user });
                     if (offset === undefined) {
                         return ok({ ok: true, data: { object: object ?? null } });
                     }
                     if (!object) {
-                        throw new Error('Object not found');
+                        throw new Error(`Object "${id}" not found`);
                     }
                     const buffer = Buffer.from(JSON.stringify(object), 'utf8');
                     const digest = createHash('sha256').update(buffer).digest('hex');
                     if (sha256 !== undefined && sha256 !== digest) {
-                        throw new Error('Object changed during chunked read; discard all chunks and restart');
+                        throw new Error(`Object "${id}" changed since the first part: read it again from offset 0`);
                     }
                     if (offset >= buffer.length) {
-                        throw new Error('Object offset must be less than its size');
+                        throw new Error(`\`offset\` must be less than the size of the object (${buffer.length} bytes)`);
                     }
                     return ok({
                         ok: true,
@@ -2667,15 +2669,57 @@ export default class McpServer {
             {
                 title: 'Read a script',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-                description: 'Read a script of the javascript adapter including its source code',
+                description:
+                    'Read a script of the javascript adapter including its source code. A source too long for ' +
+                    'one answer is read in parts: set `offset` to 0, and while the result has `truncated: true`, ' +
+                    'call again with `offset` set to the returned `nextOffset`. `size` is the source size in bytes.',
                 inputSchema: {
                     id: z.string().describe('Script id, e.g. "script.js.common.lights" or "common.lights"'),
+                    offset: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .optional()
+                        .describe('Return only a part of the source, from this byte on (0 for the first part)'),
+                    length: z
+                        .number()
+                        .int()
+                        .min(1)
+                        .optional()
+                        .describe(`Maximum number of source bytes to return (default ${DEFAULT_MAX_READ_BYTES})`),
                 },
             },
-            async ({ id }) => {
+            async ({ id, offset, length }) => {
                 try {
                     const script = await this.getScriptObject(id);
-                    return ok({ ok: true, data: this.scriptInfo(script.id, script.obj, true) });
+                    const info = this.scriptInfo(script.id, script.obj, true);
+                    if (offset === undefined && length === undefined) {
+                        return ok({ ok: true, data: info });
+                    }
+                    const source = Buffer.from(info.source as string, 'utf8');
+                    // Quotes and backslashes are escaped twice on the wire (up to 4 bytes each): halve the part
+                    // until it fits into a tool result
+                    let max = length ?? DEFAULT_MAX_READ_BYTES;
+                    for (;;) {
+                        const part = readWindow(source, true, offset ?? 0, max);
+                        const result = {
+                            ok: true,
+                            data: {
+                                ...info,
+                                source: part.content,
+                                size: part.size,
+                                offset: part.offset,
+                                length: part.length,
+                                truncated: part.truncated,
+                                ...(part.truncated ? { nextOffset: part.nextOffset } : {}),
+                            },
+                        };
+                        if (max <= 1 || wireSize(JSON.stringify(result)) <= MAX_RESULT_BYTES) {
+                            return ok(result);
+                        }
+                        // A part never splits a character, so it can be longer than `max`
+                        max = Math.floor(Math.min(max, part.length) / 2);
+                    }
                 } catch (e) {
                     return fail(e);
                 }
